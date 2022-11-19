@@ -1,11 +1,22 @@
-use std::thread;
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::thread;
 
+type Job = Box<dyn FnBox + Send + 'static>;
+
+trait FnBox {
+    fn call_box(self: Box<Self>);
+}
+
+impl<F: FnOnce()> FnBox for F {
+    fn call_box(self: Box<Self>) {
+        (*self)()
+    }
+}
 pub struct ThreadPool {
-  workers: Vec<Worker>,
-  sender: mpsc::Sender<Job>
+    workers: Vec<Worker>,
+    sender: mpsc::Sender<Message>,
 }
 
 impl ThreadPool {
@@ -21,10 +32,10 @@ impl ThreadPool {
 
         let (sender, receiver) = mpsc::channel();
         let receiver = Arc::new(Mutex::new(receiver));
-        
+
         let mut workers = Vec::with_capacity(size);
         for id in 0..size {
-          workers.push(Worker::new(id, Arc::clone(&receiver)));
+            workers.push(Worker::new(id, Arc::clone(&receiver)));
         }
         ThreadPool { workers, sender }
     }
@@ -33,24 +44,68 @@ impl ThreadPool {
     where
         F: FnOnce() + Send + 'static,
     {
+        let job = Box::new(f);
+        self.sender.send(Message::NewJob(job)).unwrap();
+    }
+}
+
+impl Drop for ThreadPool {
+    fn drop(&mut self) {
+        println!("Sending terminate message to all workers.");
+
+        for _ in &mut self.workers {
+            self.sender.send(Message::Terminate).unwrap();
+        }
+
+        println!("Shutting down all workers.");
+
+        for worker in &mut self.workers {
+            println!("Shutting down worker {}", worker.id);
+
+            // worker.thread.join().unwrap();
+            if let Some(thread) = worker.thread.take() {
+                thread.join().unwrap()
+            }
+        }
     }
 }
 
 struct Worker {
-  id: usize,
-  thread: thread::JoinHandle<()>,
+    id: usize,
+    thread: Option<thread::JoinHandle<()>>,
 }
 
 impl Worker {
-  fn new(id: usize, receiver: Arc<Mutex<mpsc::Receiver<Job>>>) -> Self {
-    let thread = thread::spawn(|| {
-      receiver;
-    });
-    Self {
-      id,
-      thread
+    fn new(id: usize, receiver: Arc<Mutex<mpsc::Receiver<Message>>>) -> Self {
+        let thread = thread::spawn(move || {
+            // loop {
+            //   let job = receiver.lock().unwrap().recv().unwrap();
+            //   println!("Worker {} got a job; executing.", id);
+            //   job.call_box();
+            // }
+            loop {
+                let message = receiver.lock().unwrap().recv().unwrap();
+                match message {
+                    Message::NewJob(job) => {
+                        println!("Worker {} got a job; executing.", id);
+                        job.call_box();
+                    }
+                    Message::Terminate => {
+                        println!("Worker {} was told to terminate.", id);
+                        break;
+                    }
+                }
+            }
+        });
+        Self {
+            id,
+            thread: Some(thread),
+        }
     }
-  }
 }
 
-struct Job;
+// struct Job;
+enum Message {
+    NewJob(Job),
+    Terminate,
+}
